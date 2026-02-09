@@ -7,14 +7,28 @@ Make sure you install [Chrome](https://www.google.com/chrome/) or [Chromium](htt
 
 # Installation
 
-You can install the library from [PyPi](https://pypi.org/project/DeeperSeek/) using the following command:
+Requires **Python 3.10+** (zendriver).
 
-### Normal Operating Systems
+### macOS with Homebrew (recommended: use a venv)
+
+Homebrew’s Python is “externally managed”, so install into a virtual environment:
+
+```sh
+cd /path/to/DeeperSeek
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .   # установить пакет DeeperSeek из репозитория
+```
+
+Or run the script: `bash scripts/setup_venv.sh`, then `source .venv/bin/activate`.
+
+### Other systems (Windows / Linux where pip is allowed)
 ```sh
 # Windows
 pip install DeeperSeek -U
 
-# Linux/macOS
+# Linux/macOS (if not using Homebrew Python)
 pip3 install DeeperSeek -U
 ```
 
@@ -137,6 +151,66 @@ await api.switch_chat("chat_id_here")
 ```py
 from DeeperSeek import Theme
 await api.switch_theme(Theme.DARK)
+```
+
+### Полный цикл: запрос и озвучка ответа
+
+1. **Запуск** — из корня репозитория, с активированным venv:
+   ```sh
+   source .venv/bin/activate
+   python examples/chat_and_speak.py
+   ```
+
+2. **Подготовка**
+   - Токен DeepSeek: https://chat.deepseek.com/ → F12 → Application → Local Storage → `userToken` → скопировать значение. Вписать в скрипт в `TOKEN` или в `.env` как `DEEPSEEK_TOKEN=...`.
+   - ElevenLabs: ключ в `.env` (`ELEVENLABS_API_KEY`) или передать `api_key` в `text_to_speech`.
+
+3. **Что делает скрипт**: создаёт сессию DeepSeek → отправляет сообщение → получает ответ → озвучивает через ElevenLabs и воспроизводит в системном плеере, сохраняет в `reply.mp3`.
+
+В коде вручную тот же цикл:
+```py
+import asyncio
+from DeeperSeek import DeepSeek, play_audio
+
+async def main():
+    api = DeepSeek(token="ВАШ_ТОКЕН", headless=True)
+    await api.initialize()
+    response = await api.send_message("Ваш вопрос", timeout=60)
+    if response:
+        audio = await api.text_to_speech(response.text, voice_id="JBFqnCBsd6RMkjVDRZzb", output_path="reply.mp3")
+        play_audio(audio)
+
+asyncio.run(main())
+```
+
+### Text-to-Speech (ElevenLabs)
+Convert response text to speech using ElevenLabs (model: Eleven Flash v2.5 by default). Requires an [ElevenLabs API key](https://elevenlabs.io/app/settings/api-keys) and a voice ID ([list voices](https://elevenlabs.io/docs/api-reference/get-voices)). Set `ELEVENLABS_API_KEY` in the environment or pass `api_key` to the call.
+
+```py
+# After getting a response
+response = await api.send_message("Hello!")
+audio = await api.text_to_speech(
+    response.text,
+    voice_id="JBFqnCBsd6RMkjVDRZzb",  # Example voice; use your preferred voice_id
+    output_path="reply.mp3",  # Optional: save to file
+)
+# audio is bytes (MP3 by default)
+
+# Play in system default player (no extra deps)
+from DeeperSeek import play_audio
+play_audio(audio)
+```
+
+Standalone (without a DeepSeek instance):
+```py
+from DeeperSeek import text_to_speech
+
+audio = await text_to_speech(
+    "Text to speak",
+    voice_id="JBFqnCBsd6RMkjVDRZzb",
+    api_key="your_api_key",  # or set ELEVENLABS_API_KEY
+    output_path="out.mp3",
+)
 ```
 
 ## Frequently Asked Questions

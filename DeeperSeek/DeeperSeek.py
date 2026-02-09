@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from inscriptis import get_text
 
 import zendriver
+from zendriver.core.keys import SpecialKeys
 
 from .internal.objects import Response, SearchResult, Theme
 from .internal.selectors import DeepSeekSelectors
@@ -26,7 +27,10 @@ class DeepSeek:
         headless: bool = True,
         verbose: bool = False,
         chrome_args: list = [],
-        attempt_cf_bypass: bool = True
+        attempt_cf_bypass: bool = True,
+        browser_executable_path: Optional[str] = None,
+        manual_login: bool = False,
+        message_prefix: Optional[str] = None,
     ) -> None:
         """Initializes the DeepSeek object.
 
@@ -48,13 +52,20 @@ class DeepSeek:
             The arguments to pass to the Chrome browser.
         attempt_cf_bypass: bool
             Whether to attempt to bypass the Cloudflare protection.
+        browser_executable_path: Optional[str]
+            Path to Chrome/Chromium executable (e.g. /Applications/Google Chrome.app/Contents/MacOS/Google Chrome).
+        manual_login: bool
+            If True, open browser and wait until you log in manually; then script continues.
+        message_prefix: Optional[str]
+            Текст, подставляемый перед каждым запросом (например, инструкция «отвечай кратко, без воды»).
+            None — без префикса.
 
         Raises
         ---------
         ValueError:
-            Either the token or the email and password must be provided.
+            Either the token or the email and password must be provided (unless manual_login=True).
         """
-        if not token and not (email and password):
+        if not manual_login and not token and not (email and password):
             raise MissingCredentials("Either the token alone or the email and password both must be provided")
 
         self._email = email
@@ -65,6 +76,9 @@ class DeepSeek:
         self._verbose = verbose
         self._chrome_args = chrome_args
         self._attempt_cf_bypass = attempt_cf_bypass
+        self._browser_executable_path = browser_executable_path
+        self._manual_login = manual_login
+        self._message_prefix = message_prefix or ""
 
         self._deepthink_enabled = False
         self._search_enabled = False
@@ -114,17 +128,17 @@ class DeepSeek:
                     )
                 raise e
 
-        # Start the browser
-        self.browser = await zendriver.start(
-            chrome_args = self._chrome_args,
-            headless = self._headless
-        )
+        # Start the browser (zendriver expects browser_args, not chrome_args)
+        start_kw = dict(browser_args=self._chrome_args, headless=self._headless)
+        if self._browser_executable_path:
+            start_kw["browser_executable_path"] = self._browser_executable_path
+        self.browser = await zendriver.start(**start_kw)
 
         self.logger.debug("Navigating to the chat page...")
         await self.browser.get("https://chat.deepseek.com/" if not self._chat_id \
             else f"https://chat.deepseek.com/a/chat/s/{self._chat_id}")
 
-        if self._attempt_cf_bypass:
+        if self._attempt_cf_bypass and not self._manual_login:
             try:
                 self.logger.debug("Verifying the Cloudflare protection...")
                 await self.browser.main_tab.verify_cf()
@@ -136,7 +150,30 @@ class DeepSeek:
         loop = get_event_loop()
         loop.create_task(self._keep_alive())
         
-        if self._token:
+        if self._manual_login:
+            self.logger.debug("Manual login: log in in the browser window, script will continue when chat is ready...")
+            last_err = None
+            for selector_name, selector, timeout in [
+                ("textbox", self.selectors.interactions.textbox, 25),
+                ("textbox_fallback", self.selectors.interactions.textbox_fallback, 25),
+                ("textarea", self.selectors.interactions.textbox_any, 550),
+            ]:
+                try:
+                    tab = getattr(self.browser, "main_tab", None)
+                    if tab is None:
+                        raise RuntimeError("Browser window was closed")
+                    await tab.wait_for(selector, timeout=timeout)
+                    self.logger.debug("Chat ready, continuing.")
+                    break
+                except Exception as e:
+                    last_err = e
+                    if self.browser is None or getattr(self.browser, "main_tab", None) is None:
+                        raise RuntimeError("Browser window was closed") from e
+                    self.logger.debug("Selector %s: %s, trying next...", selector_name, e)
+            else:
+                if last_err:
+                    raise last_err
+        elif self._token:
             await self._login()
         else:
             await self._login_classic()
@@ -155,8 +192,17 @@ class DeepSeek:
 
     def __del__(self) -> None:
         """Destructor method to stop the browser and the virtual display."""
-
         self._is_active = False
+
+    async def close(self) -> None:
+        """Останавливает браузер. Вызывайте перед выходом из скрипта, чтобы избежать ошибки atexit."""
+        self._is_active = False
+        if getattr(self, "browser", None) is not None:
+            try:
+                await self.browser.stop()
+            except Exception:
+                pass
+            self.browser = None
 
     async def _login(self) -> None:
         """Logs in to DeepSeek using a token.
@@ -173,20 +219,18 @@ class DeepSeek:
             raise MissingInitialization("You must run the initialize method before using this method.")
 
         self.logger.debug("Logging in using the token...")
+        # Экранируем токен для вставки в JS (кавычки и обратный слэш)
+        token_escaped = self._token.replace("\\", "\\\\").replace("'", "\\'")
         await self.browser.main_tab.evaluate(
-            f"localStorage.setItem('userToken', JSON.stringify({{value: '{self._token}', __version: '0'}}))",
+            f"localStorage.setItem('userToken', JSON.stringify({{value: '{token_escaped}', __version: '0'}}))",
             await_promise = True,
             return_by_value = True
         )
         await self.browser.main_tab.reload()
-        
-        # Reloading with an invalid token still gives access to the website somehow, but only for a split second
-        # So I added a delay to make sure the token is actually invalid
         await sleep(2)
-        
-        # Check if the token login was successful
+        # Даём время на загрузку чата после reload
         try:
-            await self.browser.main_tab.wait_for(self.selectors.interactions.textbox, timeout = 5)
+            await self.browser.main_tab.wait_for(self.selectors.interactions.textbox, timeout=30)
         except:
             self.logger.debug("Token failed, logging in using email and password...")
 
@@ -221,17 +265,53 @@ class DeepSeek:
         await password_input.send_keys(self._password)
 
         self.logger.debug("Checking the confirm checkbox and logging in...")
-        confirm_checkbox = await self.browser.main_tab.select(self.selectors.login.confirm_checkbox)
-        await confirm_checkbox.click()
+        try:
+            confirm_checkbox = await self.browser.main_tab.select(
+                self.selectors.login.confirm_checkbox, timeout=5
+            )
+            await confirm_checkbox.click()
+        except Exception:
+            self.logger.debug("Checkbox not found or skipped, clicking login...")
 
-        login_button = await self.browser.main_tab.select(self.selectors.login.login_button)
+        login_button = None
+        used_selector = None
+        for sel in (
+            self.selectors.login.login_button,
+            getattr(self.selectors.login, "login_button_fallback", "div[role=\"button\"]"),
+        ):
+            try:
+                login_button = await self.browser.main_tab.select(sel, timeout=5)
+                used_selector = sel
+                break
+            except Exception:
+                continue
+        if not login_button:
+            raise CouldNotFindElement("Login button not found (tried button[type=submit] and div[role=button])")
+
         await login_button.click()
+        try:
+            escaped = used_selector.replace("\\", "\\\\").replace('"', '\\"')
+            await self.browser.main_tab.evaluate(
+                f'document.querySelector("{escaped}")?.click()',
+                await_promise=True,
+                return_by_value=True,
+            )
+        except Exception:
+            pass
+        await sleep(3)
 
         try:
-            await self.browser.main_tab.wait_for(self.selectors.interactions.textbox, timeout = 5)
-        except:
-            raise InvalidCredentials("The email or password is incorrect" \
-                if not token_failed else "Both token and email/password are incorrect")
+            await self.browser.main_tab.wait_for(
+                self.selectors.interactions.textbox, timeout=20
+            )
+        except Exception:
+            try:
+                await self.browser.main_tab.wait_for(
+                    self.selectors.interactions.textbox_fallback, timeout=10
+                )
+            except Exception:
+                raise InvalidCredentials("The email or password is incorrect" \
+                    if not token_failed else "Both token and email/password are incorrect")
 
         self.logger.debug(f"Logged in successfully using email and password! {'(Token method failed)' if token_failed else ''}")
     
@@ -364,28 +444,40 @@ class DeepSeek:
         timeout += 20 if deepthink else 0
         timeout += 60 if search else 0
 
-        self.logger.debug(f"Finding the textbox and sending the message: {message}")
-        textbox = await self.browser.main_tab.select(self.selectors.interactions.textbox)
+        payload = (self._message_prefix + message).strip() if self._message_prefix else message
+        self.logger.debug("Finding the textbox and sending the message: %s", payload[:80] + ("..." if len(payload) > 80 else ""))
+        textbox = await self.browser.main_tab.select(self.selectors.interactions.textbox, timeout=15)
         if slow_mode:
-            for char in message:
+            for char in payload:
                 await textbox.send_keys(char)
                 await sleep(slow_mode_delay)
         else:
-            await textbox.send_keys(message)
+            await textbox.send_keys(payload)
 
-        # Find the parent div of both deepthink and search options
-        send_options_parent = await self.browser.main_tab.select(self.selectors.interactions.send_options_parent)
-        
-        if deepthink != self._deepthink_enabled:
-            await send_options_parent.children[0].click() # DeepThink (R1)
-            self._deepthink_enabled = deepthink
-        
-        if search != self._search_enabled:
-            await send_options_parent.children[1].click() # Search
-            self._search_enabled = search
+        # DeepThink / Search toggles (optional, skip if selector missing)
+        try:
+            send_options_parent = await self.browser.main_tab.select(
+                self.selectors.interactions.send_options_parent, timeout=3
+            )
+            if deepthink != self._deepthink_enabled:
+                await self._click_toggle_by_index_or_text(send_options_parent, 0, "deepthink", ["think", "думать"])
+                self._deepthink_enabled = deepthink
+            if search != self._search_enabled:
+                await self._click_toggle_by_index_or_text(send_options_parent, 1, "search", ["search", "поиск", "web"])
+                self._search_enabled = search
+        except Exception:
+            pass
 
-        send_button = await self.browser.main_tab.select(self.selectors.interactions.send_button)
-        await send_button.click()
+        # Отправка: клик по div[role="button"] (кнопка отправки) и Enter в поле ввода
+        try:
+            await self.browser.main_tab.evaluate(
+                'document.querySelector(\'div[role="button"]\')?.click()',
+                await_promise=True,
+                return_by_value=True,
+            )
+        except Exception:
+            pass
+        await textbox.send_keys(SpecialKeys.ENTER)
 
         return await self._get_response(timeout = timeout)
 
@@ -414,7 +506,32 @@ class DeepSeek:
         await toolbar[-1].children[1].click()
 
         return await self._get_response(timeout = timeout, regen = True)
-    
+
+    async def _click_toggle_by_index_or_text(
+        self,
+        parent: "zendriver.Element",
+        fallback_index: int,
+        label: str,
+        text_substrings: list,
+    ) -> None:
+        """Кликает переключатель по индексу или по тексту (Search/Поиск, DeepThink и т.д.)."""
+        try:
+            children = getattr(parent, "children", [])
+            if len(children) <= fallback_index:
+                return
+            text_lower = " ".join(text_substrings).lower()
+            for i, child in enumerate(children):
+                t = (getattr(child, "text_all", None) or "").lower()
+                if any(s.lower() in t for s in text_substrings):
+                    await child.click()
+                    self.logger.debug("Toggled %s by text (child %s)", label, i)
+                    return
+            await children[fallback_index].click()
+            self.logger.debug("Toggled %s by index %s", label, fallback_index)
+        except Exception as e:
+            self.logger.debug("Toggle %s: %s", label, e)
+            raise
+
     def _filter_search_results(
         self,
         search_results_children: list,
@@ -481,76 +598,53 @@ class DeepSeek:
             raise MissingInitialization("You must run the initialize method before using this method.")
 
         end_time = time() + timeout
-
-        # Wait till the response starts generating
-        # If we don't wait for the response to start re/generating, we might get the previous response
-        self.logger.debug("Waiting for the response to start generating..." if not regen \
-            else "Waiting for the response to start regenerating...")
+        # Ждём появления текста в последнем .ds-markdown (ответ ассистента) — без селекторов по хэшам
+        self.logger.debug("Waiting for the response...")
+        response_text = ""
+        last_len = 0
+        stable_count = 0
+        get_last_markdown = (
+            "(() => { const els = document.querySelectorAll('.ds-markdown'); "
+            "return els.length ? els[els.length-1].innerText.trim() : ''; })()"
+        )
         while time() < end_time:
             try:
-                _ = await self.browser.main_tab.select(self.selectors.backend.response_generating if not regen \
-                    else self.selectors.backend.regen_loading_icon)
-            except:
-                continue
+                response_text = str(await self.browser.main_tab.evaluate(get_last_markdown)).strip()
+            except Exception:
+                response_text = ""
+            if response_text and response_text.lower() != "the server is busy. please try again later.":
+                if len(response_text) == last_len:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        break
+                else:
+                    stable_count = 0
+                last_len = len(response_text)
             else:
-                break
-        
-        if time() >= end_time:
+                stable_count = 0
+            await sleep(2)
+
+        if not response_text:
             return None
-
-        # Once the response starts generating, wait till it's generated
-        response_generated = None
-        self.logger.debug("Waiting for the response to finish generating..." if not regen \
-            else "Finding the last response...")
-        while time() < end_time:
-            try:
-                response_generated: zendriver.Element = await self.browser.main_tab.select_all(
-                    self.selectors.backend.response_generated)
-            except:
-                continue
-
-            if response_generated:
-                break
-        
-        if not response_generated:
-            return None
-        
-        if regen:
-            # Wait till toolbar appears
-            self.logger.debug("Waiting for the response toolbar to appear...")
-            while time() < end_time:
-                # I need to keep refreshing the response_generated list because the elements change
-                try:
-                    response_generated: zendriver.Element = await self.browser.main_tab.select_all(
-                        self.selectors.backend.response_generated)
-                except Exception as e:
-                    continue
-
-                # Check if the toolbar is present
-                soup = BeautifulSoup(repr(response_generated[-1]), 'html.parser')
-                toolbar = soup.find("div", class_ = self.selectors.backend.response_toolbar_b64)
-                if not toolbar:
-                    continue
-
-                response_generated = await self.browser.main_tab.select_all(self.selectors.backend.response_generated)
-                break
-            
-            if time() >= end_time:
-                return None
-
-        self.logger.debug("Extracting the response text...")
-        soup = BeautifulSoup(repr(response_generated[-1]), 'html.parser')
-        response_text = str(await self.browser.main_tab.evaluate("document.querySelectorAll('.ds-markdown.ds-markdown--block').values().map((r => { for (p in r.parentElement) if (p.startsWith('__reactFiber$')) return r.parentElement[p].pendingProps.children[3].props.markdown })).toArray().join(' ');"))
-
         if response_text.lower() == "the server is busy. please try again later.":
             raise ServerDown("The server is busy. Please try again later.")
 
+        self.logger.debug("Response received, extracting...")
         search_results = None
         deepthink_duration = None
         deepthink_content = None
-
-        # 1 and 2 are the deepthink and search options
-        for child in response_generated[-1].children[1:3]:
+        response_generated = None
+        try:
+            response_generated = await self.browser.main_tab.select_all(
+                self.selectors.backend.response_generated_fallback, timeout=2
+            )
+        except Exception:
+            pass
+        try:
+            children = getattr(response_generated[-1], "children", [])[1:3] if response_generated else []
+        except (IndexError, TypeError):
+            children = []
+        for child in children:
             if match(r"found \d+ results", child.text.lower()) and self._search_enabled:
                 self.logger.debug("Extracting the search results...")
                 # So this is a search result option, we need to click it and find the search results div
@@ -798,3 +892,41 @@ class DeepSeek:
         #         break
 
         # breakpoint()
+
+    async def text_to_speech(
+        self,
+        text: str,
+        voice_id: str,
+        api_key: Optional[str] = None,
+        model_id: str = "eleven_flash_v2_5",
+        output_format: str = "mp3_44100_128",
+        output_path: Optional[str] = None,
+    ) -> bytes:
+        """Convert text to speech via ElevenLabs (Eleven Flash v2.5 by default).
+
+        Args
+        ---------
+            text (str): Text to synthesize (e.g. response.text).
+            voice_id (str): ElevenLabs voice ID. List voices: https://elevenlabs.io/docs/api-reference/get-voices.
+            api_key (Optional[str]): ElevenLabs API key. Defaults to ELEVENLABS_API_KEY env.
+            model_id (str): Model ID. Defaults to eleven_flash_v2_5.
+            output_format (str): Audio format. Defaults to mp3_44100_128.
+            output_path (Optional[str]): If set, write audio to this file.
+
+        Returns
+        ---------
+            bytes: Audio bytes.
+
+        Raises
+        ---------
+            TTSError: On missing API key or ElevenLabs API errors.
+        """
+        from .internal.tts import text_to_speech as _tts
+        return await _tts(
+            text=text,
+            voice_id=voice_id,
+            api_key=api_key,
+            model_id=model_id,
+            output_format=output_format,
+            output_path=output_path,
+        )

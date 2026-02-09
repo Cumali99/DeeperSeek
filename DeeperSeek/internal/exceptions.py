@@ -28,3 +28,7 @@ class CouldNotFindElement(DeeperSeekException):
 
 class InvalidChatID(DeeperSeekException):
     pass
+
+
+class TTSError(DeeperSeekException):
+    pass

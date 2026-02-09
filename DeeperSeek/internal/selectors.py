@@ -4,14 +4,19 @@ from dataclasses import dataclass, field
 class LoginSelectors:
     email_input: str = 'input[type="text"]'
     password_input: str = 'input[type="password"]'
-    confirm_checkbox: str = 'div[class="ds-checkbox ds-checkbox--none ds-checkbox--bordered"]'
-    login_button: str = 'div[role="button"]'
+    confirm_checkbox: str = 'div[class*="ds-checkbox"]'
+    # Кнопка «Войти»: реальный <button> с классом ds-basic-button--primary (не type=submit)
+    login_button: str = 'button.ds-basic-button--primary'
+    login_button_fallback: str = 'button[type="submit"]'
 
 @dataclass
 class InteractionSelectors:
-    textbox: str = 'textarea[class="c92459f0"]'
+    textbox: str = 'textarea[placeholder="Сообщение для DeepSeek"]'
+    textbox_fallback: str = 'textarea.ds-scroll-area'
+    textbox_any: str = 'textarea'  # для manual_login
     send_options_parent: str = 'div[class="ec4f5d61"]'
     send_button: str = 'div[class="f6d670"]'
+    send_button_fallback: str = 'button[type="submit"]'
     response_toolbar: str = 'div[class="ds-flex abe97156"]'
     reset_chat_button: str = 'div[class="e214291b"]'
     search_results: str = 'div[class="fe369d61 f529c936"]'
@@ -25,8 +30,9 @@ class InteractionSelectors:
 class BackendSelectors:
     response_generating: str = 'div[class="f9bf7997 d7dc56a8"]'
     response_generated: str = 'div[class="f9bf7997 d7dc56a8 c05b5566"]'
+    response_generated_fallback: str = 'div.ds-message'  # стабильный класс сообщения ассистента
     regen_loading_icon: str = 'div[class="ds-loading b4e4476b"]'
-    response_toolbar_b64: str = 'ds-flex abe97156'  # This is different, because it's used in BS4
+    response_toolbar_b64: str = 'ds-flex abe97156'
 
 @dataclass
 class URLSelectors:
